@@ -55,7 +55,7 @@
     
 #> 
 
-Param( [String[]]$Servers = @("DC2","DC3"),
+Param( [String[]]$Servers = @("DC3","DC2"),
        [String]$Thumbprint = "412952E8227BB605417FEB072F4C2F517817B010",
        [String]$ServerURL = "https://pull.ad.local:8080/PSDSCPullServer.svc",
        [String]$Path = "C:\DSC",
@@ -69,6 +69,11 @@ $certPass = get-content $passFile | convertto-securestring
 if ($Credential -eq $null)
 {
     $credential = Get-Credential -Message "Please enter credentials required in the configuration" -username "$($ENV:userdomain)\$($ENV:username)"
+    if ($credential -eq $null)
+    {
+        return
+    }
+
 }
 
 
@@ -77,7 +82,7 @@ Configuration ServerConfig {
     Param( [String]$GUID,
            [PsCredential]$Credential)
     
-    Import-DSCResource -ModuleName xNetworking
+    Import-DSCResource -ModuleName cDisk
 
     Node $AllNodes.NodeName
     {
@@ -85,40 +90,9 @@ Configuration ServerConfig {
         LocalConfigurationManager 
         { 
              CertificateId = $node.Thumbprint
+             RebootNodeIfNeeded = $false
         } 
-
-        File CopyFile 
-        {
-            Ensure = "Present"
-            Type = "Directory"
-            Recurse = $True
-            SourcePath = "\\pull.ad.local\DSC\Sources"
-            DestinationPath = "C:\Temp\DSCTest"
-            Credential = $Credential
-        }
-
-        Log AfterCopyFile
-        {
-            # The message below gets written to the Microsoft-Windows-Desired State Configuration/Analytic log
-            Message = "DSC Resource with ID - exampleFile - is DONE"
-            DependsOn = "[File]CopyFile" 
-        }
                      
-        xFirewall Firewall 
-        { 
-            Name                  = "Micky" 
-            DisplayName           = "Firewall Rule for my Special App" 
-            DisplayGroup          = "Special App Rule Group" 
-            Ensure                = "Present" 
-            Access                = "Allow" 
-            State                 = "Enabled" 
-            Profile               = ("Domain", "Private") 
-            Direction             = "Inbound"
-            RemotePort            = ("8080", "8081") 
-            LocalPort             = ("9080", "9081")          
-            Protocol              = "TCP" 
-            Description           = "Firewall Rule for Special App"   
-        } 
 
 		Script GetOSVersion
 		{
@@ -131,48 +105,6 @@ Configuration ServerConfig {
             }
             SetScript = {$a = 1}
    		}
-		Script TestPorts
-		{
-		    TestScript = { return $true # for now
-
-				$tcpports = @(135,137,139,389,636,3268,3269,53,88,445,42,1512)
-				$udpports = @(137,138,139,389,53,88,1512,123)
-				
-				foreach ($port in $tcpports)
-				{
-    				$Socket = New-Object Net.Sockets.TcpClient
-					$Socket.Connect("localhost", $port)
-					if ($Socket.Connected -eq $false)
-					{
-						return $false
-					}
-					else
-					{
-						$Socket.Close()
-					}
-				}
-				foreach ($port in $udpports)
-				{
-    				$Socket = New-Object Net.Sockets.UdpClient
-					$Socket.Connect("localhost", $port)
-					if ($Socket.Connected -eq $false)
-					{
-						return $false
-					}
-					else
-					{
-						$Socket.Close()
-					}
-				}
-				return $true
-    
-			}
-		    GetScript = { 
-				return @{}
-            }
-
-            SetScript = { $a = 1 }
-		}
 		Registry DisableIPV6
         {
             Ensure = "Present"  
@@ -192,202 +124,287 @@ Configuration ServerConfig {
             ValueType = "Dword"
 			DependsOn = "[Script]GetOSVersion"
         }
+        Service ShellHWDetection
+        {
+            Name = "ShellHWDetection"
+            StartupType = "Manual"
+            State = "Stopped"
+            DependsOn = "[Registry]SetNSPIMaxConnections"
+        }
+        cWaitforDisk Disk1
+        {
+             DiskNumber = 1
+             RetryIntervalSec = 60
+             RetryCount = 2
+             DependsOn = "[Service]ShellHWDetection"
+        }
+        cDisk GVolume
+        {
+             DiskNumber = 1
+             DriveLetter = 'G'
+             DependsOn = "[cWaitforDisk]Disk1"
+        }
+        Group Admins
+        {
+            GroupName = "Administrators"
+            MembersToInclude = "Ad\Enterprise Admins"
+            Credential = $Credential
+        }
+        Registry RDPnotDenied
+        {
+            Ensure = "Present"  
+            Key = "HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Terminal Server"
+            ValueName = "fDenyTSConnections"
+            ValueData = "0"
+            ValueType = "Dword"
+        }
+        Registry RDPonlySecureConnections
+        {
+            Ensure = "Present"  
+            Key = "HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+            ValueName = "UserAuthentication"
+            ValueData = "1"
+            ValueType = "Dword"
+        }
+		Script RDPenableFirewallRules
+		{
+		    TestScript = { return $true }
+		    GetScript = { 
+				return @{}
+            }
+            SetScript = {Enable-NetFirewallRule -DisplayGroup "Remote Desktop"}
+   		}
 	}
 }
-
 
 function New-ServerConfigurations
 {
-	[CmdletBinding()]
-	Param( $Path  = "C:\DSC",
-		   [String[]]$Servers,
-		   [switch]$Force,
+    [CmdletBinding()]
+    Param( $Path  = "C:\DSC",
+           [String[]]$Servers,
+           [switch]$Force,
            [PSCredential]$Credential,
            $Thumbprint,
            $Publickey)
-	begin 
-	{
+    begin
+    {
         $configurationsPath = "$path\Configurations"
-        $configGenerated = $false 
-	    $targetFiles = "$env:SystemDrive\Program Files\WindowsPowershell\DscService\Configuration"
-	    
-        if ($Force)
+        $configGenerated = $false
+        $targetFiles = "$env:SystemDrive\Program Files\WindowsPowershell\DscService\Configuration"
+        
+        $dataArray = @()
+        if (test-path "$configurationsPath\servers.csv")
         {
-            Write-Verbose "Cleaning up old config files"
-            Remove-Item "$targetFiles\*.mof*" -ErrorAction SilentlyContinue
-            if (test-path "$configurationsPath\servers.csv")
-		    {
-		        remove-item "$configurationsPath\servers.csv"
-		    }
-            $dataArray = @()
+            $dataArray += import-csv "$configurationsPath\servers.csv"
         }
-        else
-        {
-            if (test-path "$configurationsPath\servers.csv")
-		    {
-		        $dataArray = import-csv "$configurationsPath\servers.csv" -header("Server","GUID")
-		    }
-        }
-	}
-	
-	process
-	{		 
-		foreach ($server in $Servers)
-		{
-    		Write-host "Creating MOF files for $server"
-
-			$found = $false
-			# Only check if the configuration for the given server has been created if the Force param is not present.
-			# If Force is present, always generate new configurations
-			if($Force -eq $false)
-			{
-				foreach ($elem in $dataArray)
-				{
-					if ($server -eq $elem.server)
-					{
+    }
+    
+    process
+    {        
+        foreach ($server in $Servers)
+        { 
+            $foundAndDoNotForce = $false
+            $superseed = $false
+            # Only check if the configuration for the given server has been created if the Force param is not present.
+            # If Force is present, always generate new configurations
+            if($Force.IsPresent -eq $false)
+            {
+                foreach ($elem in $dataArray)
+                {
+                    if ($server -eq $elem.server)
+                    {
                         Write-Verbose "Server $server already has a configuration file, use -Force to generate a new file"
-						$found = $true
-						break
-					}
-				}
-			}
-			
-			if ($found -eq $false)
-			{
-			    $GUID = [guid]::NewGuid().ToString()
+                        $foundAndDoNotForce = $true
+                        break
+                    }
+                }
+            }
+            else
+            {
+                foreach ($elem in $dataArray)
+                {
+                    if ($server -eq $elem.server)
+                    {
+                        Write-Verbose "Found a configuration for $server superseeding with new config file"
+                        Remove-Item "$targetFiles\$($elem.guid).mof*" -ErrorAction SilentlyContinue
+                        $superseed = $true
+                        break
+                    }
+                }
+            }
+
+            
+            if ($foundAndDoNotForce -eq $false)
+            {
+                Write-host "Creating MOF files for $server"
+
+                $GUID = [guid]::NewGuid().ToString()
                 
                 $strPath = "$Path\$publickey"
-
-                $ConfigData = @{ 
-                    AllNodes = @(     
+ 
+                $ConfigData = @{
+                    AllNodes = @(    
                                     @{  
                                         NodeName = "*"
                                         CertificateFile = "$strPath"
-                                        Thumbprint = $thumbprint 
-                                    } 
-                                    @{ 
-                                        NodeName=$GUID 
+                                        Thumbprint = $thumbprint
+                                    },
+                                    @{
+                                        NodeName=$GUID
                                         CertificateFile = "$strPath"
-                                        Thumbprint = $thumbprint 
-                                    } 
-                                ) 
-                } 
-                $serverData = New-Object PSCustomObject -Property @{
-                    GUID = $newGUID;
-                    Server = $server
+                                        Thumbprint = $thumbprint
+                                    }
+                                )
                 }
-			    $newLine = "{0},{1}" -f $server,$newGUID
-			    $result = ServerConfig -GUID $newGuid -Output "$configurationsPath\ServerConfig" -Credential $credential -ConfigurationData $ConfigData
-			    $newLine | add-content -path "$configurationsPath\Servers.csv"
-		        $serverConfig = "$configurationsPath\ServerConfig"
-                $configGenerated = $true		 
-
-		        $result = New-DSCCheckSum -ConfigurationPath $serverConfig -OutPath $serverConfig -Force -Verbose
-
-                $dataArray += $serverData
-			}
-		}
-
-	}
-	end
-	{
+                if ($superseed)
+                {
+                    foreach ($elem in $dataArray)
+                    {
+                        if ($server -eq $elem.server)
+                        {
+                            $elem.GUID = $GUID;
+                            break
+                        }
+                    }
+                }
+                else
+                {
+                    $serverData = New-Object PSCustomObject -Property @{
+                        GUID = $GUID;
+                        Server = $server
+                    }
+                    $dataArray += $serverData
+                }
+                $result = ServerConfig -GUID $Guid -Output "$configurationsPath\ServerConfig" -Credential $credential -safemodePass $safemodePass -ConfigurationData $ConfigData
+                $serverConfig = "$configurationsPath\ServerConfig"
+                $configGenerated = $true        
+ 
+                $result = New-DSCCheckSum -ConfigurationPath $serverConfig -OutPath $serverConfig -Force -Verbose
+ 
+            }
+        }
+ 
+    }
+    end
+    {
         if ($configGenerated)
         {
-		    Write-Verbose "Copying configurations to DSC service configuration store..."
-		    $sourceFiles = "$configurationsPath\ServerConfig\*.mof*"
-		    Move-Item $sourceFiles $targetFiles -Force -Verbose
-		    Remove-Item $sourceFiles
-
-            return [array]$dataArray
+            Write-Verbose "Copying configurations to DSC service configuration store..."
+            $sourceFiles = "$configurationsPath\ServerConfig\*.mof*"
+            Move-Item $sourceFiles $targetFiles -Force -Verbose
+            Remove-Item $sourceFiles 
         }
-	}
+        $dataArray | select Server, GUID | Export-Csv "$configurationsPath\Servers.csv" -NoTypeInformation
+
+        return [array]$dataArray
+    }
 }
+ 
 
 function Export-ServerConfigurations
 {
-	[CmdletBinding()]
-	Param( $path = "C:\DSC",
-		   [String[]]$servers,
+    [CmdletBinding()]
+    Param( $path = "C:\DSC",
+           [String[]]$servers,
            $CertPass,
            $thumbprint,
            $privatekey,
            [array]$configurations,
            $serverURL)
-	begin 
-	{
+    begin
+    {
     }
-    process 
+    process
     {
         # Distribute the new configurations
         foreach ($server in $servers)
         {
-            write-host "Deploying configuration to $server"
-            # Ensure the certificate is installed on the remote server
-            [array] $Thumbprints = Invoke-Command -ComputerName $server -ScriptBlock {
-                (dir Cert:\LocalMachine\My) | %{
-                                     # Verify the certificate is for Encryption and valid
-                                     if ($_.subject -eq "CN=PULL.ad.local" -and $_.Verify())
-                                     {
-                                         return $_.Thumbprint
-                                     }
-                                 }
-            }
-            $found = $Thumbprints | ? { $_ -eq $thumbprint}
+            $alive = Test-connection $server -Quiet -Count 1
 
-            if ($found -eq $null)
+            if ($alive)
             {
-                write-host "Certificate (thumbprint: $thumbprint) required to decrypt the configuration file is missing on $server, copying file"
-
-                copy-Item "$path\$privatekey" "\\$server\c$\temp\$privatekey"
-                Invoke-Command -ComputerName $server -ArgumentList @($privatekey,$certpass) -ScriptBlock  {
-                    $cert = $args[0]
-                    $pass = $args[1]
-                    Import-PfxCertificate –FilePath "c:\temp\$cert" cert:\localMachine\my -Password $pass
+                write-host "Deploying configuration to $server"
+                # Ensure the certificate is installed on the remote server
+                [array] $Thumbprints = Invoke-Command -ComputerName $server -ArgumentList @($thumbprint) -ScriptBlock {
+                    $thumbprint = $args[0]
+                    (dir Cert:\LocalMachine\My) | %{
+                                         # Verify the certificate is for Encryption and valid
+                                         if ($_.thumbprint -eq $thumbprint)
+                                         {
+                                             return $_.Thumbprint
+                                         }
+                                     }
                 }
-                Remove-Item "\\$server\c$\temp\$privatekey"
-            }
+                $found = $Thumbprints | ? { $_ -eq $thumbprint}
+ 
+                if ($found -eq $null)
+                {
+                    write-host "Certificate (thumbprint: $thumbprint) required to decrypt the configuration file is missing on $server, copying file"
+ 
+                    copy-Item "$path\$privatekey" "\\$server\c$\temp\$privatekey"
+                    Invoke-Command -ComputerName $server -ArgumentList @($privatekey,$certpass) -ScriptBlock  {
+                        $cert = $args[0]
+                        $pass = $args[1]
+                        Import-PfxCertificate –FilePath "c:\temp\$cert" cert:\localMachine\my -Password $pass
+                    }
+                    Remove-Item "\\$server\c$\temp\$privatekey"
+                }
+ 
+                $GUID = ($configurations | where-object {$_."Server" -eq $server}).GUID
+                Write-Verbose "Configuration ID for $Server is $GUID"
 
-            $GUID = ($configurations | where-object {$_."Server" -eq $server}).GUID
-    
-            Invoke-Command -ComputerName $server -ArgumentList @($GUID,$thumbprint,$serverURL) -ScriptBlock {
-                Configuration DiscoverConfigurationForPull 
-                { 
-
-                    Param([String]$GUID,
-                          [String]$thumbprint,
-                          [String]$serverURL)
+                Invoke-Command -ComputerName $server -ArgumentList @($GUID,$thumbprint,$serverURL) -ScriptBlock {
+                    Configuration DiscoverConfigurationForPull
+                    {
+ 
+                        Param([String]$GUID,
+                              [String]$thumbprint,
+                              [String]$serverURL)
                     
-                    $serverURLhashtable = @{ServerUrl = "$serverURL"}
-                    LocalConfigurationManager 
-                    { 
-                        ConfigurationID = $GUID;
-                        CertificateId = $thumbprint;
-                        RefreshMode = "PULL";
-                        DownloadManagerName = "WebDownloadManager";
-                        RebootNodeIfNeeded = $true;
-                        RefreshFrequencyMins = 30;
-                        ConfigurationModeFrequencyMins = 30; 
-                        ConfigurationMode = "ApplyAndAutoCorrect";
-                        DownloadManagerCustomData = @{ServerUrl = "$serverURL"}
-                    } 
-                }  
+                        $serverURLhashtable = @{ServerUrl = "$serverURL"}
+                        LocalConfigurationManager
+                        {
+                            ConfigurationID = $GUID;
+                            CertificateId = $thumbprint;
+                            RefreshMode = "PULL";
+                            DownloadManagerName = "WebDownloadManager";
+                            RebootNodeIfNeeded = $true;
+                            RefreshFrequencyMins = 30;
+                            ConfigurationModeFrequencyMins = 30;
+                            ConfigurationMode = "ApplyAndAutoCorrect";
+                            DownloadManagerCustomData = @{ServerUrl = "$serverURL"}
+                        }
+                    }  
+ 
+                    $GUID = $args[0]
+                    $thumbprint = $args[1]
+                    $serverURL = $args[2]
 
-                $GUID = $args[0]
-                $thumbprint = $args[1]
-                $serverURL = $args[2]
-                $result = DiscoverConfigurationForPull -GUID $GUID -thumbprint $thumbprint -serverURL $serverURL -Output "."
-                $FilePath = (Get-Location -PSProvider FileSystem).Path + "\DiscoverConfigurationForPull"
+                    $localConfig = Get-DscLocalConfigurationManager
+                    if ($localconfig.ConfigurationID -ne $GUID)
+                    {
+                        $result = DiscoverConfigurationForPull -GUID $GUID -thumbprint $thumbprint -serverURL $serverURL -Output "."
+                        $FilePath = (Get-Location -PSProvider FileSystem).Path + "\DiscoverConfigurationForPull"
                 
-                Set-DscLocalConfigurationManager -ComputerName "localhost" -Path $FilePath -Verbose    
+                        Set-DscLocalConfigurationManager -ComputerName "localhost" -Path $FilePath -Verbose    
+                    }
+                    else
+                    {
+                        Write-Error "This configuration is already deployed (Configuration ID = $GUID)"
+                    }
+                }
+            }
+            else
+            {
+                write-host "Server $server is not reachable" -foreground red 
             }
         }
     }
-    end 
+    end
     {
     }
 }
-
-[array] $configurations = Generate-ServerConfigurations -path $path -Servers $Servers -Force -Credential $credential -thumbprint $thumbprint -publickey $publicKey
-
-Export-ServerConfigurations -path $path -Servers $newServers -thumbprint $thumbprint -configurations $configurations -privatekey $privatekey -CertPass $certPass -serverURL $serverURL -Verbose 
-
+ 
+[array] $configurations = New-ServerConfigurations -path $path -Servers $Servers -Credential $credential -thumbprint $thumbprint -publickey $publicKey -Verbose -Force
+ 
+Export-ServerConfigurations -path $path -Servers $Servers -thumbprint $thumbprint -configurations $configurations -privatekey $privatekey -CertPass $certPass -serverURL $serverURL -Verbose
