@@ -55,7 +55,7 @@
     
 #> 
 
-Param( [String[]]$Servers = @("DC3","DC2"),
+Param( [String[]]$Servers = @("DC3"),
        [String]$Thumbprint = "412952E8227BB605417FEB072F4C2F517817B010",
        [String]$ServerURL = "https://pull.ad.local:8080/PSDSCPullServer.svc",
        [String]$Path = "C:\DSC",
@@ -131,18 +131,18 @@ Configuration ServerConfig {
             State = "Stopped"
             DependsOn = "[Registry]SetNSPIMaxConnections"
         }
-        cWaitforDisk Disk1
+        cWaitforDisk Disk0
         {
-             DiskNumber = 1
+             DiskNumber = 0
              RetryIntervalSec = 60
              RetryCount = 2
              DependsOn = "[Service]ShellHWDetection"
         }
-        cDisk GVolume
+        cDisk RVolume
         {
-             DiskNumber = 1
-             DriveLetter = 'G'
-             DependsOn = "[cWaitforDisk]Disk1"
+             DiskNumber = 0
+             DriveLetter = 'R'
+             DependsOn = "[cWaitforDisk]Disk0"
         }
         Group Admins
         {
@@ -174,6 +174,12 @@ Configuration ServerConfig {
             }
             SetScript = {Enable-NetFirewallRule -DisplayGroup "Remote Desktop"}
    		}
+        WindowsFeature WSB
+        { 
+            Ensure = "Present" 
+            Name = "Windows-Server-Backup" 
+        }
+
 	}
 }
 
@@ -275,7 +281,7 @@ function New-ServerConfigurations
                     }
                     $dataArray += $serverData
                 }
-                $result = ServerConfig -GUID $Guid -Output "$configurationsPath\ServerConfig" -Credential $credential -safemodePass $safemodePass -ConfigurationData $ConfigData
+                $result = ServerConfig -GUID $Guid -Output "$configurationsPath\ServerConfig" -Credential $credential -ConfigurationData $ConfigData
                 $serverConfig = "$configurationsPath\ServerConfig"
                 $configGenerated = $true        
  
@@ -331,10 +337,12 @@ function Export-ServerConfigurations
                                          # Verify the certificate is for Encryption and valid
                                          if ($_.thumbprint -eq $thumbprint)
                                          {
-                                             return $_.Thumbprint
+                                             $_.Thumbprint
                                          }
                                      }
                 }
+
+                $Thumbprints
                 $found = $Thumbprints | ? { $_ -eq $thumbprint}
  
                 if ($found -eq $null)
