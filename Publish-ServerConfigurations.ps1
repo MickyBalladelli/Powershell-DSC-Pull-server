@@ -55,7 +55,7 @@
     
 #> 
 
-Param( [String[]]$Servers = @("SRV1.ad.local"),
+Param( [String[]]$Servers = @("DC2.ad.local"),
        [String]$Thumbprint = "6B3A112A227FBABBA4946CFD3BB9662485F6D48D",
        [String]$ServerURL = "https://pull.ad.local:8080/PSDSCPullServer.svc",
        [String]$Path = "C:\DSC",
@@ -381,7 +381,7 @@ function Export-ServerConfigurations
             {
                 write-host "Deploying configuration to $server"
                 # Ensure the certificate is installed on the remote server
-                [array] $Thumbprints = Invoke-Command -ComputerName $server -ArgumentList @($thumbprint) -ScriptBlock {
+                [array] $Thumbprints = Invoke-Command -Credential $Credential -ComputerName $server -ArgumentList @($thumbprint) -ScriptBlock {
                     $thumbprint = $args[0]
                     (dir Cert:\LocalMachine\My) | %{
                                          # Verify the certificate is for Encryption and valid
