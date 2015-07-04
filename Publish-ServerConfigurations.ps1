@@ -55,18 +55,19 @@
     
 #> 
 
-Param( [String[]]$Servers = @("DC3"),
-       [String]$Thumbprint = "412952E8227BB605417FEB072F4C2F517817B010",
+Param( [String[]]$Servers = @("SRV1.ad.local"),
+       [String]$Thumbprint = "6B3A112A227FBABBA4946CFD3BB9662485F6D48D",
        [String]$ServerURL = "https://pull.ad.local:8080/PSDSCPullServer.svc",
        [String]$Path = "C:\DSC",
        [String]$PublicKey = "PULLPublicKey.cer",
        [String]$Privatekey = "PULLprivatekey.pfx",
        [String]$PassFile = "c:\dsc\certpass.txt",
-       [PsCredential]$Credential)
+       [PsCredential]$Credential,
+       [String]$DSCfile = "c:\dsc\dsc.txt")
 
 $certPass = get-content $passFile | convertto-securestring 
 
-if ($Credential -eq $null)
+if ($Credential -eq $null -and !(Test-Path $DSCfile))
 {
     $credential = Get-Credential -Message "Please enter credentials required in the configuration" -username "$($ENV:userdomain)\$($ENV:username)"
     if ($credential -eq $null)
@@ -75,6 +76,12 @@ if ($Credential -eq $null)
     }
 
 }
+else
+{
+    $DSCpass = get-content $DSCFile | convertto-securestring 
+    $Credential = new-object -typename System.Management.Automation.PSCredential -argumentlist "AD\Administrator",$DSCpass
+}
+
 
 
 Configuration ServerConfig {
@@ -82,7 +89,10 @@ Configuration ServerConfig {
     Param( [String]$GUID,
            [PsCredential]$Credential)
     
+#    Import-DSCResource -ModuleName cADDomainController
     Import-DSCResource -ModuleName cDisk
+    Import-DSCResource -ModuleName cWSB
+    Import-DSCResource -ModuleName cSystemInfo
 
     Node $AllNodes.NodeName
     {
@@ -93,7 +103,6 @@ Configuration ServerConfig {
              RebootNodeIfNeeded = $false
         } 
                      
-
 		Script GetOSVersion
 		{
 		    TestScript = {   
@@ -103,7 +112,7 @@ Configuration ServerConfig {
 		    GetScript = { 
 				return @{}
             }
-            SetScript = {$a = 1}
+            SetScript = { }
    		}
 		Registry DisableIPV6
         {
@@ -112,7 +121,6 @@ Configuration ServerConfig {
             ValueName = "DisabledComponents"
             ValueData = "255"
             ValueType = "Dword"
-			DependsOn = "[Script]GetOSVersion"
         }
 		
 		Registry SetNSPIMaxConnections
@@ -122,14 +130,12 @@ Configuration ServerConfig {
             ValueName = "NSPI max sessions per user"
             ValueData = "256"
             ValueType = "Dword"
-			DependsOn = "[Script]GetOSVersion"
         }
         Service ShellHWDetection
         {
             Name = "ShellHWDetection"
             StartupType = "Manual"
             State = "Stopped"
-            DependsOn = "[Registry]SetNSPIMaxConnections"
         }
         cWaitforDisk Disk0
         {
@@ -143,12 +149,6 @@ Configuration ServerConfig {
              DiskNumber = 0
              DriveLetter = 'R'
              DependsOn = "[cWaitforDisk]Disk0"
-        }
-        Group Admins
-        {
-            GroupName = "Administrators"
-            MembersToInclude = "Ad\Enterprise Admins"
-            Credential = $Credential
         }
         Registry RDPnotDenied
         {
@@ -174,10 +174,59 @@ Configuration ServerConfig {
             }
             SetScript = {Enable-NetFirewallRule -DisplayGroup "Remote Desktop"}
    		}
+        
         WindowsFeature WSB
         { 
             Ensure = "Present" 
             Name = "Windows-Server-Backup" 
+        }
+        cWSB policy
+        {
+            State = "Started"
+            Schedule = "0:00"
+            Destination = "R:"
+            Baremetal = "True"
+            DependsOn = "[WindowsFeature]WSB"
+        }
+        
+#        WindowsFeature AD-Feature
+#        { 
+#            Ensure = "Present" 
+#            Name = "AD-Domain-Services" 
+#        }        
+#        cADDomainController promotion
+#        {
+#            DomainName = "ad.local"
+#            DomainAdministratorCredential = $Credential
+#            SafemodeAdministratorPassword = $Credential
+#            DatabasePath = "C:\NTDS"
+#            LogPath = "C:\NTDS\LOG"
+#            SysvolPath = "C:\SYSVOL" 
+#            DependsOn = "[WindowsFeature]AD-Feature"
+#            Ensure = "Present"
+#        }
+
+        Service wbengine
+        {
+            Name = "wbengine"
+            StartupType = "Manual" 
+            DependsOn = "[cWSB]policy"
+        }
+        Service vss
+        {
+            Name = "vss"
+            StartupType = "Manual" 
+            DependsOn = "[cWSB]policy"
+        }
+        Service vds
+        {
+            Name = "vds"
+            StartupType = "Manual" 
+            DependsOn = "[cWSB]policy"
+        }
+        cSystemInfo info
+        {
+            GetInfo = "Yes"
         }
 
 	}
@@ -316,7 +365,8 @@ function Export-ServerConfigurations
            $thumbprint,
            $privatekey,
            [array]$configurations,
-           $serverURL)
+           $serverURL,
+           $Credential)
     begin
     {
     }
@@ -348,20 +398,35 @@ function Export-ServerConfigurations
                 if ($found -eq $null)
                 {
                     write-host "Certificate (thumbprint: $thumbprint) required to decrypt the configuration file is missing on $server, copying file"
- 
-                    copy-Item "$path\$privatekey" "\\$server\c$\temp\$privatekey"
-                    Invoke-Command -ComputerName $server -ArgumentList @($privatekey,$certpass) -ScriptBlock  {
+
+                    $driveGuid = [guid]::newguid()
+                    $PSDrive = new-PSDrive -name $driveGuid -root "\\$server\c$" –PSProvider FileSystem -Credential $Credential
+		            $sharePath = [string]$driveGuid + ":\temp"
+            		if ($PSDrive -eq $null)
+                    {
+                        Write-Error "PSDrive could not be created to server $server"
+                        throw
+                    }
+
+                    if ((Test-Path $sharePath) -eq $false)
+                    {
+                        mkdir $sharePath
+                    }
+                    copy-Item "$path\$privatekey" "$sharePath\$privatekey" 
+
+                    Invoke-Command -Credential $Credential -ComputerName $server -ArgumentList @($privatekey,$certpass) -ScriptBlock  {
                         $cert = $args[0]
                         $pass = $args[1]
                         Import-PfxCertificate –FilePath "c:\temp\$cert" cert:\localMachine\my -Password $pass
                     }
-                    Remove-Item "\\$server\c$\temp\$privatekey"
+                    Remove-Item "$sharePath\$privatekey"
+                    Remove-PSDrive -force -Name $driveGuid
                 }
  
                 $GUID = ($configurations | where-object {$_."Server" -eq $server}).GUID
                 Write-Verbose "Configuration ID for $Server is $GUID"
 
-                Invoke-Command -ComputerName $server -ArgumentList @($GUID,$thumbprint,$serverURL) -ScriptBlock {
+                Invoke-Command -Credential $Credential -ComputerName $server -ArgumentList @($GUID,$thumbprint,$serverURL) -ScriptBlock {
                     Configuration DiscoverConfigurationForPull
                     {
  
@@ -376,10 +441,10 @@ function Export-ServerConfigurations
                             CertificateId = $thumbprint;
                             RefreshMode = "PULL";
                             DownloadManagerName = "WebDownloadManager";
-                            RebootNodeIfNeeded = $true;
+                            RebootNodeIfNeeded = $false;
                             RefreshFrequencyMins = 30;
                             ConfigurationModeFrequencyMins = 30;
-                            ConfigurationMode = "ApplyAndAutoCorrect";
+                            ConfigurationMode = "ApplyAndMonitor";
                             DownloadManagerCustomData = @{ServerUrl = "$serverURL"}
                         }
                     }  
@@ -415,4 +480,9 @@ function Export-ServerConfigurations
  
 [array] $configurations = New-ServerConfigurations -path $path -Servers $Servers -Credential $credential -thumbprint $thumbprint -publickey $publicKey -Verbose -Force
  
-Export-ServerConfigurations -path $path -Servers $Servers -thumbprint $thumbprint -configurations $configurations -privatekey $privatekey -CertPass $certPass -serverURL $serverURL -Verbose
+Export-ServerConfigurations -path $path -Servers $Servers -thumbprint $thumbprint -Credential $Credential -configurations $configurations -privatekey $privatekey -CertPass $certPass -serverURL $serverURL -Verbose
+
+
+# $cimsession = New-CimSession -Credential $Credential -ComputerName srv1.ad.local
+# Update-DscConfiguration -CimSession $cimsession -Verbose -Wait
+# Test-DscConfiguration -CimSession $cimsession -Verbose
