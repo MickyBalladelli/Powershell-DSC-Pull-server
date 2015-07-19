@@ -55,7 +55,7 @@
     
 #> 
 
-Param( [String[]]$Servers = @("DC2.ad.local"),
+Param( [String[]]$Servers,
        [String]$Thumbprint = "6B3A112A227FBABBA4946CFD3BB9662485F6D48D",
        [String]$ServerURL = "https://pull.ad.local:8080/PSDSCPullServer.svc",
        [String]$Path = "C:\DSC",
